@@ -2,14 +2,16 @@ import os
 import re
 import subprocess
 import tempfile
-import shutil
-from urllib.parse import urlparse
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
+import uuid
+from pathlib import Path
+from typing import Optional
 
-app = FastAPI(title="ClipFactory API", version="2.1.0")
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+
+app = FastAPI(title="ClipFactory API", version="0.031")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,174 +19,164 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
 )
 
-
-def has_binary(name: str) -> bool:
-    return shutil.which(name) is not None
-
-
-def is_valid_http_url(url: str) -> bool:
-    try:
-        p = urlparse(url.strip())
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
+DOWNLOAD_DIR = Path(tempfile.gettempdir()) / "clipfactory_downloads"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def safe_filename(name: str) -> str:
-    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "clipfactory_video").strip("._")
-    if not clean:
-        clean = "clipfactory_video"
-    if not clean.lower().endswith(".mp4"):
-        clean += ".mp4"
-    return clean
+class DownloadRequest(BaseModel):
+    url: str
+    start_sec: Optional[float] = 0
+    end_sec: Optional[float] = 1800
+    full_if_shorter: Optional[bool] = True
 
 
-def format_hhmmss(total_sec: int) -> str:
-    sec = max(0, int(total_sec))
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def _clean_youtube_url(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        raise ValueError("URL vazia.")
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = "https://" + url
+    return url
 
 
-@app.get("/health")
-def health():
-    return {
-        "ok": True,
-        "service": "clipfactory-api",
-        "yt_dlp": has_binary("yt-dlp"),
-        "ffmpeg": has_binary("ffmpeg"),
-    }
-
-
-@app.get("/api/download")
-def download_video(
-    url: str = Query(..., description="URL do vídeo ou live"),
-    start_sec: int = Query(0, ge=0, le=7200),
-    end_sec: int = Query(1800, ge=1, le=7200),
-    full_if_shorter: bool = Query(True),
-):
-    if not is_valid_http_url(url):
-        raise HTTPException(status_code=400, detail="URL inválida.")
-    if not has_binary("yt-dlp"):
-        raise HTTPException(status_code=500, detail="yt-dlp não encontrado no servidor.")
-
-    clean_url = url.strip()
-    safe_start = max(0, int(start_sec))
-    safe_end = max(safe_start + 5, int(end_sec))
-    span_sec = min(1800, max(5, safe_end - safe_start))
-
-    tmp_dir = tempfile.mkdtemp(prefix="cf_dl_")
-    out_template = os.path.join(tmp_dir, "raw_video.%(ext)s")
-    final_mp4 = os.path.join(tmp_dir, "clipfactory_download.mp4")
-
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "--no-warnings",
-        "--live-from-start",
-        "-f",
-        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        out_template,
+def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float], full_if_shorter: bool) -> Path:
+    clients_to_try = [
+        "android_vr,web_safari,web",
+        "ios,android,web",
+        "tv_embedded,web",
+        "default",
     ]
+    last_err = ""
 
-    should_trim = not (full_if_shorter and safe_start == 0 and safe_end >= 1800)
-    if should_trim and has_binary("ffmpeg"):
-        section_spec = f"*{format_hhmmss(safe_start)}-{format_hhmmss(safe_start + span_sec)}"
-        cmd.extend(["--download-sections", section_spec, "--force-keyframes-at-cuts"])
+    for client_list in clients_to_try:
+        for f in out_base.parent.glob(f"{out_base.name}*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
 
-    cookies_file = os.environ.get("YTDLP_COOKIES_FILE", "").strip()
-    if cookies_file and os.path.exists(cookies_file):
-        cmd.extend(["--cookies", cookies_file])
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--retries", "3",
+            "--fragment-retries", "3",
+            "--force-ipv4",
+            "--merge-output-format", "mp4",
+            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+            "-o", f"{out_base}.%(ext)s",
+        ]
 
-    cmd.append(clean_url)
+        if client_list != "default":
+            cmd.extend(["--extractor-args", f"youtube:player_client={client_list}"])
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=260)
-        if proc.returncode != 0 and "--download-sections" in cmd:
-            # Fallback sem --download-sections para lives/plataformas que não aceitam recorte remoto
-            for f in os.listdir(tmp_dir):
+        cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+        cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+        temp_cookie_path = None
+        if cookies_b64 and not cookies_file:
+            import base64
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
+            tf.write(base64.b64decode(cookies_b64))
+            tf.close()
+            temp_cookie_path = tf.name
+            cookies_file = temp_cookie_path
+        if cookies_file and os.path.isfile(cookies_file):
+            cmd.extend(["--cookies", cookies_file])
+
+        if start_sec is not None and end_sec is not None and end_sec > start_sec:
+            s = max(0.0, float(start_sec))
+            e = max(s + 1.0, float(end_sec))
+            cmd.extend(["--download-sections", f"*{s}-{e}"])
+
+        cmd.append(url)
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            if temp_cookie_path and os.path.exists(temp_cookie_path):
                 try:
-                    os.remove(os.path.join(tmp_dir, f))
+                    os.unlink(temp_cookie_path)
                 except Exception:
                     pass
-            fallback_cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "--no-warnings",
-                "-f",
-                "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-                "--merge-output-format",
-                "mp4",
-                "-o",
-                out_template,
-            ]
-            if cookies_file and os.path.exists(cookies_file):
-                fallback_cmd.extend(["--cookies", cookies_file])
-            fallback_cmd.append(clean_url)
-            proc = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=260)
 
-        if proc.returncode != 0:
-            lines = (proc.stderr or proc.stdout or "Falha ao baixar o vídeo.").strip().splitlines()
-            err_msg = lines[-1] if lines else "Falha ao baixar o vídeo."
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise HTTPException(status_code=400, detail=f"yt-dlp: {err_msg}")
+            if proc.returncode == 0:
+                matches = sorted(
+                    [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
+                    key=lambda p: p.stat().st_size,
+                    reverse=True,
+                )
+                if matches:
+                    return matches[0]
+            last_err = (proc.stderr or proc.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            last_err = "Tempo limite excedido ao processar o vídeo."
+        except Exception as exc:
+            last_err = str(exc)
 
-        downloaded_files = [
-            os.path.join(tmp_dir, f)
-            for f in os.listdir(tmp_dir)
-            if os.path.isfile(os.path.join(tmp_dir, f)) and not f.startswith("clipfactory_download")
-        ]
-        if not downloaded_files:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise HTTPException(status_code=404, detail="Nenhum arquivo de vídeo foi gerado.")
+    raise RuntimeError(last_err or "Falha ao extrair mídia com yt-dlp.")
 
-        src_file = downloaded_files[0]
-        target_file = src_file
 
-        if has_binary("ffmpeg"):
-            trim_cmd = [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                "0" if "--download-sections" in cmd else str(safe_start),
-                "-t",
-                str(span_sec),
-                "-i",
-                src_file,
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                final_mp4,
-            ]
-            t_proc = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
-            if t_proc.returncode == 0 and os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 0:
-                target_file = final_mp4
+def _remove_file(path_str: str) -> None:
+    try:
+        p = Path(path_str)
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
 
-        parsed_host = urlparse(clean_url).hostname or "video"
-        dl_name = safe_filename(f"clipfactory_{parsed_host}_{span_sec // 60}m")
 
-        return FileResponse(
-            path=target_file,
-            media_type="video/mp4",
-            filename=dl_name,
-            headers={
-                "Content-Disposition": f'attachment; filename="{dl_name}"'
-            },
-            background=BackgroundTask(shutil.rmtree, tmp_dir, True),
+@app.get("/")
+@app.get("/health")
+def health():
+    yt_ver = "unknown"
+    try:
+        r = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            yt_ver = r.stdout.strip()
+    except Exception:
+        pass
+    return {"status": "ok", "version": "0.031", "yt_dlp": yt_ver}
+
+
+@app.post("/download")
+@app.get("/download")
+async def download_video(
+    background_tasks: BackgroundTasks,
+    req: Optional[DownloadRequest] = None,
+    url: Optional[str] = Query(default=None),
+    start_sec: Optional[float] = Query(default=0),
+    end_sec: Optional[float] = Query(default=1800),
+    full_if_shorter: Optional[bool] = Query(default=True),
+):
+    target_url = req.url if req and req.url else url
+    s_sec = req.start_sec if req and req.start_sec is not None else start_sec
+    e_sec = req.end_sec if req and req.end_sec is not None else end_sec
+    full_short = req.full_if_shorter if req and req.full_if_shorter is not None else bool(full_if_shorter)
+
+    if not target_url:
+        raise HTTPException(status_code=400, detail="Informe a URL do vídeo.")
+
+    try:
+        clean_url = _clean_youtube_url(target_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    job_id = uuid.uuid4().hex[:12]
+    out_base = DOWNLOAD_DIR / f"clip_{job_id}"
+
+    try:
+        file_path = _run_yt_dlp(clean_url, out_base, s_sec, e_sec, full_short)
+    except RuntimeError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"error": f"Falha ao baixar vídeo pela API: yt-dlp: {exc}"},
         )
-    except HTTPException:
-        raise
-    except subprocess.TimeoutExpired:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=504, detail="Tempo limite excedido ao baixar o vídeo.")
-    except Exception as e:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
+
+    background_tasks.add_task(_remove_file, str(file_path))
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=f"clipfactory_{job_id}.mp4",
+        background=background_tasks,
+    )
