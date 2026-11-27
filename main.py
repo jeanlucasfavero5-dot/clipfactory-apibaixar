@@ -1,4 +1,3 @@
-import base64
 import os
 import re
 import subprocess
@@ -46,95 +45,66 @@ def _clean_youtube_url(raw_url: str) -> str:
     return url
 
 
-def _build_cookie_file() -> Optional[str]:
-    cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-    if cookies_file and os.path.isfile(cookies_file):
-        return cookies_file
-    cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
-    cookies_raw = os.getenv("YTDLP_COOKIES", "").strip()
-    content = ""
-    if cookies_b64:
-        try:
-            content = base64.b64decode(cookies_b64).decode("utf-8", errors="ignore")
-        except Exception:
-            content = ""
-    elif cookies_raw:
-        content = cookies_raw
-    if content.strip():
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
-        tf.write(content)
-        tf.close()
-        return tf.name
-    return None
-
-
 def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float]) -> Path:
-    client_strategies = [
+    strategies = [
         ["--extractor-args", "youtube:player_client=tv_embedded,web_safari,web"],
-        ["--extractor-args", "youtube:player_client=mweb,web"],
+        ["--extractor-args", "youtube:player_client=mweb,web_safari"],
+        ["--extractor-args", "youtube:player_client=android_vr,mweb,web"],
         ["--extractor-args", "youtube:player_client=ios,mweb"],
-        ["--extractor-args", "youtube:player_client=android_vr,web"],
-        ["--extractor-args", "youtube:player_client=web_creator,web"],
+        ["--extractor-args", "youtube:player_client=web_creator,mweb"],
+        ["--extractor-args", "youtube:player_client=web_embedded,web"],
         [],
     ]
+    proxy_url = os.getenv("YTDLP_PROXY", "").strip()
     last_err = ""
-    cookie_path = _build_cookie_file()
-    cleanup_cookie = bool(cookie_path and not os.getenv("YTDLP_COOKIES_FILE"))
 
-    try:
-        for extra_args in client_strategies:
-            for f in out_base.parent.glob(f"{out_base.name}*"):
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
-
-            cmd = [
-                "yt-dlp",
-                "--no-playlist",
-                "--no-warnings",
-                "--geo-bypass",
-                "--force-ipv4",
-                "--retries", "3",
-                "--fragment-retries", "3",
-                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                "--merge-output-format", "mp4",
-                "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-                "-o", f"{out_base}.%(ext)s",
-            ]
-            cmd.extend(extra_args)
-
-            if cookie_path:
-                cmd.extend(["--cookies", cookie_path])
-
-            if start_sec is not None and end_sec is not None and float(end_sec) > float(start_sec):
-                s = max(0.0, float(start_sec))
-                e = max(s + 1.0, float(end_sec))
-                cmd.extend(["--download-sections", f"*{s}-{e}"])
-
-            cmd.append(url)
-
+    for extra_args in strategies:
+        for f in out_base.parent.glob(f"{out_base.name}*"):
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-                if proc.returncode == 0:
-                    matches = sorted(
-                        [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
-                        key=lambda p: p.stat().st_size,
-                        reverse=True,
-                    )
-                    if matches:
-                        return matches[0]
-                last_err = (proc.stderr or proc.stdout or "").strip()
-            except subprocess.TimeoutExpired:
-                last_err = "Tempo limite excedido ao processar o vídeo."
-            except Exception as exc:
-                last_err = str(exc)
-    finally:
-        if cleanup_cookie and cookie_path and os.path.exists(cookie_path):
-            try:
-                os.unlink(cookie_path)
+                f.unlink()
             except Exception:
                 pass
+
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--no-warnings",
+            "--geo-bypass",
+            "--force-ipv4",
+            "--retries", "3",
+            "--fragment-retries", "3",
+            "--sleep-requests", "1",
+            "--merge-output-format", "mp4",
+            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+            "-o", f"{out_base}.%(ext)s",
+        ]
+        cmd.extend(extra_args)
+
+        if proxy_url:
+            cmd.extend(["--proxy", proxy_url])
+
+        if start_sec is not None and end_sec is not None and float(end_sec) > float(start_sec):
+            s = max(0.0, float(start_sec))
+            e = max(s + 1.0, float(end_sec))
+            cmd.extend(["--download-sections", f"*{s}-{e}"])
+
+        cmd.append(url)
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+            if proc.returncode == 0:
+                matches = sorted(
+                    [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
+                    key=lambda p: p.stat().st_size,
+                    reverse=True,
+                )
+                if matches:
+                    return matches[0]
+            last_err = (proc.stderr or proc.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            last_err = "Tempo limite excedido ao processar o vídeo."
+        except Exception as exc:
+            last_err = str(exc)
 
     raise RuntimeError(last_err or "Falha ao extrair mídia com yt-dlp.")
 
@@ -172,80 +142,3 @@ async def download_video(
     background_tasks: BackgroundTasks,
     full_path: str = "",
     req: Optional[DownloadRequest] = None,
-    url: Optional[str] = Query(default=None),
-    start_sec: Optional[float] = Query(default=None),
-    end_sec: Optional[float] = Query(default=None),
-):
-    body_json = {}
-    if request.method == "POST":
-        try:
-            body_json = await request.json()
-            if not isinstance(body_json, dict):
-                body_json = {}
-        except Exception:
-            body_json = {}
-
-    q = request.query_params
-    target_url = (
-        url
-        or q.get("video_url")
-        or q.get("link")
-        or body_json.get("url")
-        or body_json.get("video_url")
-        or body_json.get("link")
-        or (req.url if req else None)
-        or (req.video_url if req else None)
-        or (req.link if req else None)
-    )
-
-    s_raw = (
-        start_sec
-        if start_sec is not None
-        else (
-            q.get("start_sec")
-            or q.get("start")
-            or body_json.get("start_sec")
-            or body_json.get("start")
-            or (req.start_sec if req and req.start_sec is not None else None)
-            or (req.start if req and req.start is not None else 0)
-        )
-    )
-    e_raw = (
-        end_sec
-        if end_sec is not None
-        else (
-            q.get("end_sec")
-            or q.get("end")
-            or body_json.get("end_sec")
-            or body_json.get("end")
-            or (req.end_sec if req and req.end_sec is not None else None)
-            or (req.end if req and req.end is not None else 1800)
-        )
-    )
-
-    if not target_url:
-        raise HTTPException(status_code=404, detail=f"Rota ou URL não encontrada: /{full_path}")
-
-    try:
-        clean_url = _clean_youtube_url(str(target_url))
-        s_sec = float(s_raw) if s_raw is not None else 0.0
-        e_sec = float(e_raw) if e_raw is not None else 1800.0
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    job_id = uuid.uuid4().hex[:12]
-    out_base = DOWNLOAD_DIR / f"clip_{job_id}"
-
-    try:
-        file_path = _run_yt_dlp(clean_url, out_base, s_sec, e_sec)
-    except RuntimeError as exc:
-        msg = f"Falha ao baixar vídeo pela API: yt-dlp: {exc}"
-        return JSONResponse(status_code=502, content={"error": msg, "detail": msg})
-
-    background_tasks.add_task(_remove_file, str(file_path))
-    return FileResponse(
-        path=str(file_path),
-        media_type="video/mp4",
-        filename=f"clipfactory_{job_id}.mp4",
-        background=background_tasks,
-    )
