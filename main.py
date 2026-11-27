@@ -46,77 +46,92 @@ def _clean_youtube_url(raw_url: str) -> str:
     return url
 
 
+def _build_cookie_file() -> Optional[str]:
+    cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+    if cookies_file and os.path.isfile(cookies_file):
+        return cookies_file
+    cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+    cookies_raw = os.getenv("YTDLP_COOKIES", "").strip()
+    content = ""
+    if cookies_b64:
+        try:
+            content = base64.b64decode(cookies_b64).decode("utf-8", errors="ignore")
+        except Exception:
+            content = ""
+    elif cookies_raw:
+        content = cookies_raw
+    if content.strip():
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w", encoding="utf-8")
+        tf.write(content)
+        tf.close()
+        return tf.name
+    return None
+
+
 def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float]) -> Path:
-    clients_to_try = [
-        "android_vr,web_safari,web",
-        "ios,android,web",
-        "tv_embedded,web",
-        "default",
+    client_strategies = [
+        ["--extractor-args", "youtube:player_client=android_vr,web_safari,web"],
+        ["--extractor-args", "youtube:player_client=tv_embedded,web"],
+        ["--extractor-args", "youtube:player_client=mweb,web"],
+        ["--extractor-args", "youtube:player_client=ios,android"],
+        [],
     ]
     last_err = ""
+    cookie_path = _build_cookie_file()
+    cleanup_cookie = bool(cookie_path and not os.getenv("YTDLP_COOKIES_FILE"))
 
-    for client_list in clients_to_try:
-        for f in out_base.parent.glob(f"{out_base.name}*"):
-            try:
-                f.unlink()
-            except Exception:
-                pass
-
-        cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--no-warnings",
-            "--retries", "3",
-            "--fragment-retries", "3",
-            "--force-ipv4",
-            "--merge-output-format", "mp4",
-            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-            "-o", f"{out_base}.%(ext)s",
-        ]
-
-        if client_list != "default":
-            cmd.extend(["--extractor-args", f"youtube:player_client={client_list}"])
-
-        cookies_file = os.getenv("YTDLP_COOKIES_FILE", "").strip()
-        cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
-        temp_cookie_path = None
-        if cookies_b64 and not cookies_file:
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-            tf.write(base64.b64decode(cookies_b64))
-            tf.close()
-            temp_cookie_path = tf.name
-            cookies_file = temp_cookie_path
-        if cookies_file and os.path.isfile(cookies_file):
-            cmd.extend(["--cookies", cookies_file])
-
-        if start_sec is not None and end_sec is not None and float(end_sec) > float(start_sec):
-            s = max(0.0, float(start_sec))
-            e = max(s + 1.0, float(end_sec))
-            cmd.extend(["--download-sections", f"*{s}-{e}"])
-
-        cmd.append(url)
-
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-            if temp_cookie_path and os.path.exists(temp_cookie_path):
+    try:
+        for extra_args in client_strategies:
+            for f in out_base.parent.glob(f"{out_base.name}*"):
                 try:
-                    os.unlink(temp_cookie_path)
+                    f.unlink()
                 except Exception:
                     pass
 
-            if proc.returncode == 0:
-                matches = sorted(
-                    [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
-                    key=lambda p: p.stat().st_size,
-                    reverse=True,
-                )
-                if matches:
-                    return matches[0]
-            last_err = (proc.stderr or proc.stdout or "").strip()
-        except subprocess.TimeoutExpired:
-            last_err = "Tempo limite excedido ao processar o vídeo."
-        except Exception as exc:
-            last_err = str(exc)
+            cmd = [
+                "yt-dlp",
+                "--no-playlist",
+                "--no-warnings",
+                "--geo-bypass",
+                "--retries", "3",
+                "--fragment-retries", "3",
+                "--merge-output-format", "mp4",
+                "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+                "-o", f"{out_base}.%(ext)s",
+            ]
+            cmd.extend(extra_args)
+
+            if cookie_path:
+                cmd.extend(["--cookies", cookie_path])
+
+            if start_sec is not None and end_sec is not None and float(end_sec) > float(start_sec):
+                s = max(0.0, float(start_sec))
+                e = max(s + 1.0, float(end_sec))
+                cmd.extend(["--download-sections", f"*{s}-{e}"])
+
+            cmd.append(url)
+
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+                if proc.returncode == 0:
+                    matches = sorted(
+                        [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
+                        key=lambda p: p.stat().st_size,
+                        reverse=True,
+                    )
+                    if matches:
+                        return matches[0]
+                last_err = (proc.stderr or proc.stdout or "").strip()
+            except subprocess.TimeoutExpired:
+                last_err = "Tempo limite excedido ao processar o vídeo."
+            except Exception as exc:
+                last_err = str(exc)
+    finally:
+        if cleanup_cookie and cookie_path and os.path.exists(cookie_path):
+            try:
+                os.unlink(cookie_path)
+            except Exception:
+                pass
 
     raise RuntimeError(last_err or "Falha ao extrair mídia com yt-dlp.")
 
