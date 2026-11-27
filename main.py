@@ -1,3 +1,4 @@
+import base64
 import os
 import re
 import subprocess
@@ -6,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
@@ -26,9 +27,13 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DownloadRequest(BaseModel):
-    url: str
+    url: Optional[str] = None
+    video_url: Optional[str] = None
+    link: Optional[str] = None
     start_sec: Optional[float] = 0
     end_sec: Optional[float] = 1800
+    start: Optional[float] = None
+    end: Optional[float] = None
     full_if_shorter: Optional[bool] = True
 
 
@@ -41,7 +46,7 @@ def _clean_youtube_url(raw_url: str) -> str:
     return url
 
 
-def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float], full_if_shorter: bool) -> Path:
+def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float]) -> Path:
     clients_to_try = [
         "android_vr,web_safari,web",
         "ios,android,web",
@@ -76,7 +81,6 @@ def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: O
         cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
         temp_cookie_path = None
         if cookies_b64 and not cookies_file:
-            import base64
             tf = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
             tf.write(base64.b64decode(cookies_b64))
             tf.close()
@@ -85,7 +89,7 @@ def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: O
         if cookies_file and os.path.isfile(cookies_file):
             cmd.extend(["--cookies", cookies_file])
 
-        if start_sec is not None and end_sec is not None and end_sec > start_sec:
+        if start_sec is not None and end_sec is not None and float(end_sec) > float(start_sec):
             s = max(0.0, float(start_sec))
             e = max(s + 1.0, float(end_sec))
             cmd.extend(["--download-sections", f"*{s}-{e}"])
@@ -139,26 +143,75 @@ def health():
     return {"status": "ok", "version": "0.031", "yt_dlp": yt_ver}
 
 
-@app.post("/download")
-@app.get("/download")
+@app.api_route("/download", methods=["GET", "POST"])
+@app.api_route("/baixar", methods=["GET", "POST"])
+@app.api_route("/api/download", methods=["GET", "POST"])
+@app.api_route("/api/baixar", methods=["GET", "POST"])
+@app.api_route("/video/download", methods=["GET", "POST"])
+@app.api_route("/{full_path:path}", methods=["GET", "POST"])
 async def download_video(
+    request: Request,
     background_tasks: BackgroundTasks,
+    full_path: str = "",
     req: Optional[DownloadRequest] = None,
     url: Optional[str] = Query(default=None),
-    start_sec: Optional[float] = Query(default=0),
-    end_sec: Optional[float] = Query(default=1800),
-    full_if_shorter: Optional[bool] = Query(default=True),
+    start_sec: Optional[float] = Query(default=None),
+    end_sec: Optional[float] = Query(default=None),
 ):
-    target_url = req.url if req and req.url else url
-    s_sec = req.start_sec if req and req.start_sec is not None else start_sec
-    e_sec = req.end_sec if req and req.end_sec is not None else end_sec
-    full_short = req.full_if_shorter if req and req.full_if_shorter is not None else bool(full_if_shorter)
+    body_json = {}
+    if request.method == "POST":
+        try:
+            body_json = await request.json()
+            if not isinstance(body_json, dict):
+                body_json = {}
+        except Exception:
+            body_json = {}
+
+    q = request.query_params
+    target_url = (
+        url
+        or q.get("video_url")
+        or q.get("link")
+        or body_json.get("url")
+        or body_json.get("video_url")
+        or body_json.get("link")
+        or (req.url if req else None)
+        or (req.video_url if req else None)
+        or (req.link if req else None)
+    )
+
+    s_raw = (
+        start_sec
+        if start_sec is not None
+        else (
+            q.get("start_sec")
+            or q.get("start")
+            or body_json.get("start_sec")
+            or body_json.get("start")
+            or (req.start_sec if req and req.start_sec is not None else None)
+            or (req.start if req and req.start is not None else 0)
+        )
+    )
+    e_raw = (
+        end_sec
+        if end_sec is not None
+        else (
+            q.get("end_sec")
+            or q.get("end")
+            or body_json.get("end_sec")
+            or body_json.get("end")
+            or (req.end_sec if req and req.end_sec is not None else None)
+            or (req.end if req and req.end is not None else 1800)
+        )
+    )
 
     if not target_url:
-        raise HTTPException(status_code=400, detail="Informe a URL do vídeo.")
+        raise HTTPException(status_code=404, detail=f"Rota ou URL não encontrada: /{full_path}")
 
     try:
-        clean_url = _clean_youtube_url(target_url)
+        clean_url = _clean_youtube_url(str(target_url))
+        s_sec = float(s_raw) if s_raw is not None else 0.0
+        e_sec = float(e_raw) if e_raw is not None else 1800.0
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -166,12 +219,10 @@ async def download_video(
     out_base = DOWNLOAD_DIR / f"clip_{job_id}"
 
     try:
-        file_path = _run_yt_dlp(clean_url, out_base, s_sec, e_sec, full_short)
+        file_path = _run_yt_dlp(clean_url, out_base, s_sec, e_sec)
     except RuntimeError as exc:
-        return JSONResponse(
-            status_code=502,
-            content={"error": f"Falha ao baixar vídeo pela API: yt-dlp: {exc}"},
-        )
+        msg = f"Falha ao baixar vídeo pela API: yt-dlp: {exc}"
+        return JSONResponse(status_code=502, content={"error": msg, "detail": msg})
 
     background_tasks.add_task(_remove_file, str(file_path))
     return FileResponse(
