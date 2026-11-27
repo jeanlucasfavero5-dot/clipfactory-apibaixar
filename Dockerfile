@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir --upgrade "yt-dlp[default]" -r requirements.txt
 COPY main.py .
 
 ENV PORT=10000
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["sh", "-c", "yt-dlp -U || true; uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
