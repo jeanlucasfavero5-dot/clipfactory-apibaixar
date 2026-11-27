@@ -70,10 +70,11 @@ def _build_cookie_file() -> Optional[str]:
 
 def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: Optional[float]) -> Path:
     client_strategies = [
-        ["--extractor-args", "youtube:player_client=android_vr,web_safari,web"],
-        ["--extractor-args", "youtube:player_client=tv_embedded,web"],
+        ["--extractor-args", "youtube:player_client=tv_embedded,web_safari,web"],
         ["--extractor-args", "youtube:player_client=mweb,web"],
-        ["--extractor-args", "youtube:player_client=ios,android"],
+        ["--extractor-args", "youtube:player_client=ios,mweb"],
+        ["--extractor-args", "youtube:player_client=android_vr,web"],
+        ["--extractor-args", "youtube:player_client=web_creator,web"],
         [],
     ]
     last_err = ""
@@ -93,8 +94,10 @@ def _run_yt_dlp(url: str, out_base: Path, start_sec: Optional[float], end_sec: O
                 "--no-playlist",
                 "--no-warnings",
                 "--geo-bypass",
+                "--force-ipv4",
                 "--retries", "3",
                 "--fragment-retries", "3",
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "--merge-output-format", "mp4",
                 "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
                 "-o", f"{out_base}.%(ext)s",
