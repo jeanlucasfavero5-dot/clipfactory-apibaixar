@@ -171,21 +171,21 @@ def _run_yt_dlp(
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_cfg)
             if proc.returncode == 0:
                 matches = sorted(
-                    [p for p in out_base.parent.glob(f"{out_base.name}*") if p.is_file() and p.stat().st_size > 0],
-                    key=lambda p: p.stat().st_size,
-                    reverse=True,
-                )
-                if matches:
-                    return matches[0]
-            last_err = (proc.stderr or proc.stdout or "").strip()
-            # Se ainda funciona sem erro mas sem arquivo, tenta próxima estratégia
-        except subprocess.TimeoutExpired:
-            last_err = "Tempo limite excedido ao processar o vídeo."
-        except Exception as exc:
-            last_err = str(exc)
+def _friendly_error(stderr: str) -> str:
+    s = (stderr or "").lower()
+    if "sign in to confirm" in s or "not a bot" in s:
+        return (
+            "O YouTube bloqueou o IP deste servidor. Isso é bloqueio de IP de datacenter, "
+            "não do app. Soluções: (1) use o PWA apontando para a API self-hosted "
+            "(?api=https://SEU-TUNNEL.trycloudflare.com) ou (2) configure YTDLP_PROXY no "
+            "Render com um proxy residencial."
+        )
+    if "po token" in s or "gvs" in s or "sabr" in s:
+        return "O YouTube exigiu token de origem para este vídeo. Tente novamente — o plugin PO Token foi acionado; se persistir, atualize a imagem (yt-dlp -U)."
+    if "live event" in s or "is live" in s:
+        return "A live ainda não tem VOD. Para lives em andamento, cole o link da live (o app usa gravação desde o início)."
+    return ""
 
-    friendly = _friendly_error(last_err)
-    raise RuntimeError(friendly or (last_err or "Falha ao extrair mídia com yt-dlp."))
 def _run_yt_dlp(
     url: str,
     out_base: Path,
